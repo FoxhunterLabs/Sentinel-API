@@ -15,23 +15,11 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .config import SETTINGS
 from .deps import check_db, check_redis
+from .integrations import setup_integrations
 from .lifespan import on_startup, on_shutdown
 from .logging import configure_logging
 from .middleware import metrics_and_drain_middleware
 from .state import state
-
-# Optional integrations
-try:
-    import sentry_sdk
-    from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
-except Exception:
-    sentry_sdk = None
-    SentryAsgiMiddleware = None
-
-try:
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-except Exception:
-    FastAPIInstrumentor = None
 
 
 log = configure_logging()
@@ -50,13 +38,7 @@ app = FastAPI(
 )
 
 app.middleware("http")(metrics_and_drain_middleware(log))
-
-if SETTINGS.sentry_dsn and sentry_sdk:
-    sentry_sdk.init(dsn=SETTINGS.sentry_dsn)
-    app.add_middleware(SentryAsgiMiddleware)
-
-if FastAPIInstrumentor:
-    FastAPIInstrumentor.instrument_app(app)
+setup_integrations(app, log)
 
 # -------------------------
 # Health
