@@ -1,15 +1,10 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
-import logging
-import os
 import signal
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import httpx
 from fastapi import (
@@ -19,20 +14,15 @@ from fastapi import (
     Request,
     Response,
 )
-from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from prometheus_client import (
-    CONTENT_TYPE_LATEST,
-    Counter,
-    Gauge,
-    Histogram,
-    generate_latest,
-)
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-# -------------------------
+from .config import SETTINGS
+from .logging import configure_logging
+from .metrics import REQUEST_COUNT, REQUEST_LATENCY
+from .state import state, rate_loop
+
 # Optional integrations
-# -------------------------
-
 try:
     import sentry_sdk
     from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
@@ -58,111 +48,10 @@ except Exception:
     FastAPIInstrumentor = None
 
 
-# -------------------------
-# Config
-# -------------------------
-
-@dataclass(frozen=True)
-class Settings:
-    environment: str
-    pod_id: str
-    database_url: Optional[str]
-    redis_url: Optional[str]
-    mlflow_tracking_uri: Optional[str]
-    sentry_dsn: Optional[str]
-    metrics_token: Optional[str]
-
-    dep_timeout: float = 1.5
-    shutdown_grace_seconds: float = 40.0
-
-
-def load_settings() -> Settings:
-    return Settings(
-        environment=os.getenv("ENVIRONMENT", "development"),
-        pod_id=os.getenv("POD_ID", "unknown"),
-        database_url=os.getenv("DATABASE_URL"),
-        redis_url=os.getenv("REDIS_URL"),
-        mlflow_tracking_uri=os.getenv("MLFLOW_TRACKING_URI"),
-        sentry_dsn=os.getenv("SENTRY_DSN"),
-        metrics_token=os.getenv("METRICS_TOKEN"),
-    )
-
-
-SETTINGS = load_settings()
-
+log = configure_logging()
 
 # -------------------------
-# Logging
-# -------------------------
-
-class JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
-            "level": record.levelname,
-            "msg": record.getMessage(),
-            "pod_id": SETTINGS.pod_id,
-            "env": SETTINGS.environment,
-        }
-        for k in (
-            "request_id",
-            "path",
-            "method",
-            "status_code",
-            "duration_ms",
-        ):
-            if hasattr(record, k):
-                payload[k] = getattr(record, k)
-        return json.dumps(payload)
-
-
-logging.basicConfig(level=logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
-logging.getLogger().handlers = [handler]
-log = logging.getLogger("bi.api")
-
-
-# -------------------------
-# Metrics
-# -------------------------
-
-REQUEST_COUNT = Counter(
-    "http_requests_total", "HTTP requests", ["method", "path", "status"]
-)
-REQUEST_LATENCY = Histogram(
-    "http_request_duration_seconds", "Latency", ["method", "path"]
-)
-PREDICTIONS_PER_SECOND = Gauge(
-    "predictions_per_second", "Predictions/sec (per pod)"
-)
-PREDICTIONS_TOTAL = Counter("predictions_total", "Total predictions")
-
-
-# -------------------------
-# App state
-# -------------------------
-
-class AppState:
-    def __init__(self):
-        self.ready = True
-        self.shutting_down = False
-        self.active_requests = 0
-
-        self.http: Optional[httpx.AsyncClient] = None
-        self.db_engine = None
-        self.redis = None
-
-        self._rate_window = 0
-        self._rate_ts = time.monotonic()
-        self._rate_task: Optional[asyncio.Task] = None
-
-
-state = AppState()
-
-
-# -------------------------
-# Lifespan (startup + drain)
+# Lifespan
 # -------------------------
 
 async def on_startup():
@@ -183,6 +72,7 @@ async def on_startup():
 async def on_shutdown():
     log.info("shutdown: waiting for active requests")
     deadline = time.time() + SETTINGS.shutdown_grace_seconds
+
     while state.active_requests > 0 and time.time() < deadline:
         await asyncio.sleep(0.1)
 
@@ -204,12 +94,12 @@ async def lifespan(app: FastAPI):
 
 
 # -------------------------
-# FastAPI app
+# App
 # -------------------------
 
 app = FastAPI(
-    title="Business Intelligence API",
-    version="3.0",
+    title="Sentinel API",
+    version="0.1.0",
     lifespan=lifespan,
 )
 
@@ -237,11 +127,16 @@ async def metrics_and_drain(request: Request, call_next):
         state.active_requests -= 1
 
     dur_ms = int((time.perf_counter() - start) * 1000)
+
     REQUEST_COUNT.labels(
-        request.method, request.url.path, response.status_code
+        request.method,
+        request.url.path,
+        response.status_code,
     ).inc()
+
     REQUEST_LATENCY.labels(
-        request.method, request.url.path
+        request.method,
+        request.url.path,
     ).observe(dur_ms / 1000)
 
     log.info(
@@ -260,48 +155,40 @@ async def metrics_and_drain(request: Request, call_next):
 
 
 # -------------------------
-# Dependency checks (with retry)
+# Health
 # -------------------------
 
 async def check_db():
     if not state.db_engine:
-        return True, "db:disabled"
+        return True
 
-    for i in range(3):
-        try:
-            def _ping():
-                with state.db_engine.connect() as c:
-                    c.execute(text("SELECT 1"))
+    def _ping():
+        with state.db_engine.connect() as c:
+            c.execute(text("SELECT 1"))
 
-            await asyncio.wait_for(
-                asyncio.to_thread(_ping), SETTINGS.dep_timeout
-            )
-            return True, "db:ok"
-        except Exception:
-            if i == 2:
-                return False, "db:fail"
-            await asyncio.sleep(0.3)
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_ping),
+            SETTINGS.dep_timeout,
+        )
+        return True
+    except Exception:
+        return False
 
 
 async def check_redis():
     if not state.redis:
-        return True, "redis:disabled"
+        return True
 
-    for i in range(3):
-        try:
-            await asyncio.wait_for(
-                state.redis.ping(), SETTINGS.dep_timeout
-            )
-            return True, "redis:ok"
-        except Exception:
-            if i == 2:
-                return False, "redis:fail"
-            await asyncio.sleep(0.3)
+    try:
+        await asyncio.wait_for(
+            state.redis.ping(),
+            SETTINGS.dep_timeout,
+        )
+        return True
+    except Exception:
+        return False
 
-
-# -------------------------
-# Health endpoints
-# -------------------------
 
 @app.get("/live")
 async def live():
@@ -312,12 +199,9 @@ async def live():
 async def ready(response: Response):
     if not state.ready:
         response.status_code = 503
-        return {"ready": False, "reason": "draining"}
+        return {"ready": False}
 
-    db_ok, _ = await check_db()
-    r_ok, _ = await check_redis()
-
-    ok = db_ok and r_ok
+    ok = await check_db() and await check_redis()
     if not ok:
         response.status_code = 503
     return {"ready": ok}
@@ -327,12 +211,12 @@ async def ready(response: Response):
 async def prestop():
     state.ready = False
     log.warning("preStop: draining")
-    await asyncio.sleep(8.0)
-    return {"ok": True, "draining": True, "delay_applied": True}
+    await asyncio.sleep(8)
+    return {"ok": True}
 
 
 # -------------------------
-# Metrics (auth protected)
+# Metrics
 # -------------------------
 
 security = HTTPBearer(auto_error=False)
@@ -343,7 +227,7 @@ async def metrics(
 ):
     if SETTINGS.metrics_token:
         if not creds or creds.credentials != SETTINGS.metrics_token:
-            raise HTTPException(status_code=403, detail="Forbidden")
+            raise HTTPException(status_code=403)
 
     return Response(
         content=generate_latest(),
@@ -352,33 +236,18 @@ async def metrics(
 
 
 # -------------------------
-# Prediction example
+# Prediction
 # -------------------------
-
-def record_prediction(n=1):
-    state._rate_window += n
-    PREDICTIONS_TOTAL.inc(n)
-
-
-async def rate_loop():
-    while True:
-        await asyncio.sleep(1)
-        now = time.monotonic()
-        rate = state._rate_window / max(now - state._rate_ts, 1e-6)
-        PREDICTIONS_PER_SECOND.set(rate)
-        state._rate_window = 0
-        state._rate_ts = now
-
 
 @app.post("/predict")
 async def predict(payload: Dict[str, Any]):
     await asyncio.sleep(0.02)
-    record_prediction()
+    state.record_prediction()
     return {"score": 0.42}
 
 
 # -------------------------
-# Signal handling
+# Signals
 # -------------------------
 
 def handle_signal(sig, _):
@@ -389,3 +258,4 @@ def handle_signal(sig, _):
 
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
+
