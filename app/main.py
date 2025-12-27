@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import signal
-import time
-import uuid
 from typing import Any, Dict
 
 from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
-    Request,
     Response,
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -20,7 +17,7 @@ from .config import SETTINGS
 from .deps import check_db, check_redis
 from .lifespan import on_startup, on_shutdown
 from .logging import configure_logging
-from .metrics import REQUEST_COUNT, REQUEST_LATENCY
+from .middleware import metrics_and_drain_middleware
 from .state import state
 
 # Optional integrations
@@ -52,56 +49,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.middleware("http")(metrics_and_drain_middleware(log))
+
 if SETTINGS.sentry_dsn and sentry_sdk:
     sentry_sdk.init(dsn=SETTINGS.sentry_dsn)
     app.add_middleware(SentryAsgiMiddleware)
 
 if FastAPIInstrumentor:
     FastAPIInstrumentor.instrument_app(app)
-
-
-# -------------------------
-# Middleware
-# -------------------------
-
-@app.middleware("http")
-async def metrics_and_drain(request: Request, call_next):
-    request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
-    start = time.perf_counter()
-
-    state.active_requests += 1
-    try:
-        response = await call_next(request)
-    finally:
-        state.active_requests -= 1
-
-    dur_ms = int((time.perf_counter() - start) * 1000)
-
-    REQUEST_COUNT.labels(
-        request.method,
-        request.url.path,
-        response.status_code,
-    ).inc()
-
-    REQUEST_LATENCY.labels(
-        request.method,
-        request.url.path,
-    ).observe(dur_ms / 1000)
-
-    log.info(
-        "request",
-        extra={
-            "request_id": request_id,
-            "path": request.url.path,
-            "method": request.method,
-            "status_code": response.status_code,
-            "duration_ms": dur_ms,
-        },
-    )
-
-    response.headers["x-request-id"] = request_id
-    return response
-
 
 # -------------------------
 # Health
