@@ -1,5 +1,4 @@
 ________________________________________
-Sentinel API
 Sentinel API is a production-hardened service shell for running critical backend workloads safely.
 It is not a product.
 It is not a platform.
