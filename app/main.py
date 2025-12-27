@@ -6,7 +6,6 @@ import time
 import uuid
 from typing import Any, Dict
 
-import httpx
 from fastapi import (
     Depends,
     FastAPI,
@@ -18,9 +17,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .config import SETTINGS
+from .deps import check_db, check_redis
+from .lifespan import on_startup, on_shutdown
 from .logging import configure_logging
 from .metrics import REQUEST_COUNT, REQUEST_LATENCY
-from .state import state, rate_loop
+from .state import state
 
 # Optional integrations
 try:
@@ -31,18 +32,6 @@ except Exception:
     SentryAsgiMiddleware = None
 
 try:
-    import sqlalchemy as sa
-    from sqlalchemy import text
-except Exception:
-    sa = None
-    text = None
-
-try:
-    import redis.asyncio as redis
-except Exception:
-    redis = None
-
-try:
     from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 except Exception:
     FastAPIInstrumentor = None
@@ -50,52 +39,12 @@ except Exception:
 
 log = configure_logging()
 
-# -------------------------
-# Lifespan
-# -------------------------
-
-async def on_startup():
-    log.info("startup")
-    state.http = httpx.AsyncClient(timeout=SETTINGS.dep_timeout)
-
-    if SETTINGS.database_url and sa:
-        state.db_engine = sa.create_engine(
-            SETTINGS.database_url, pool_pre_ping=True
-        )
-
-    if SETTINGS.redis_url and redis:
-        state.redis = redis.from_url(SETTINGS.redis_url)
-
-    state._rate_task = asyncio.create_task(rate_loop())
-
-
-async def on_shutdown():
-    log.info("shutdown: waiting for active requests")
-    deadline = time.time() + SETTINGS.shutdown_grace_seconds
-
-    while state.active_requests > 0 and time.time() < deadline:
-        await asyncio.sleep(0.1)
-
-    if state._rate_task:
-        state._rate_task.cancel()
-
-    if state.http:
-        await state.http.aclose()
-    if state.redis:
-        await state.redis.close()
-    if state.db_engine:
-        state.db_engine.dispose()
-
 
 async def lifespan(app: FastAPI):
-    await on_startup()
+    await on_startup(log)
     yield
-    await on_shutdown()
+    await on_shutdown(log)
 
-
-# -------------------------
-# App
-# -------------------------
 
 app = FastAPI(
     title="Sentinel API",
@@ -158,38 +107,6 @@ async def metrics_and_drain(request: Request, call_next):
 # Health
 # -------------------------
 
-async def check_db():
-    if not state.db_engine:
-        return True
-
-    def _ping():
-        with state.db_engine.connect() as c:
-            c.execute(text("SELECT 1"))
-
-    try:
-        await asyncio.wait_for(
-            asyncio.to_thread(_ping),
-            SETTINGS.dep_timeout,
-        )
-        return True
-    except Exception:
-        return False
-
-
-async def check_redis():
-    if not state.redis:
-        return True
-
-    try:
-        await asyncio.wait_for(
-            state.redis.ping(),
-            SETTINGS.dep_timeout,
-        )
-        return True
-    except Exception:
-        return False
-
-
 @app.get("/live")
 async def live():
     return {"live": True}
@@ -204,6 +121,7 @@ async def ready(response: Response):
     ok = await check_db() and await check_redis()
     if not ok:
         response.status_code = 503
+
     return {"ready": ok}
 
 
@@ -258,4 +176,3 @@ def handle_signal(sig, _):
 
 signal.signal(signal.SIGTERM, handle_signal)
 signal.signal(signal.SIGINT, handle_signal)
-
